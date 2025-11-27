@@ -1,90 +1,325 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8" />
-    <title>Detector de Frutas YOLO ONNX</title>
-    <style>
-        body {
-            background: #111;
-            color: white;
-            text-align: center;
-            font-family: Arial;
-        }
-        video, canvas {
-            width: 90%;
-            max-width: 480px;
-            border: 3px solid orange;
-            margin-top: 20px;
-            border-radius: 10px;
-        }
-    </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Detector de Frutas - YOLO ONNX (Web)</title>
 
-    <!-- ONNX Runtime Web -->
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; background:#101218; color:#fff; text-align:center; margin:0; padding:18px;}
+  h1{margin:6px 0 12px 0; color:#ffcc00}
+  #controls { margin-bottom:10px; }
+  button{ background:#0b84ff; color:#fff; border:none; padding:12px 18px; border-radius:8px; font-size:16px; cursor:pointer;}
+  #video, #canvas { width:100%; max-width:480px; border-radius:12px; display:block; margin:12px auto; }
+  #status{ margin-top:8px; font-size:14px; color:#ddd }
+</style>
+
+<!-- ONNX Runtime Web -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
 </head>
-
 <body>
-    <h1>Detector de Frutas con YOLO</h1>
+  <h1>Detector de Frutas - YOLO (ONNX)</h1>
 
-    <video id="video" autoplay playsinline></video>
-    <canvas id="canvas"></canvas>
+  <div id="controls">
+    <button id="btnStart">📸 Activar cámara y comenzar</button>
+  </div>
 
-    <script>
-        const MODEL_URL = 
-        "https://raw.githubusercontent.com/73983748-cloud/deteccion-de-frutas-con-yolo/main/detections/yolo11n.onnx";
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="status">Estado: esperando</div>
 
-        // Activa la cámara trasera
-        async function iniciarCamara() {
-            const video = document.getElementById("video");
+<script>
+/* -------------------------- CONFIG -------------------------- */
+const MODEL_URL = "https://raw.githubusercontent.com/73983748-cloud/deteccion-de-frutas-con-yolo/main/detections/yolo11n.onnx";
+// Tamaño de entrada esperado por tu modelo (ajusta si tu export fue con otro tamaño)
+const MODEL_INPUT_SIZE = 640;
 
-            const stream = await navigator.mediaDevices.getUserMedia({
-                video: { facingMode: "environment" },
-                audio: false
-            });
+// Umbrales
+const CONF_THRESHOLD = 0.35;   // confidencia mínima (obj * class)
+const IOU_THRESHOLD = 0.45;    // NMS IoU
 
-            video.srcObject = stream;
+// Colores, etc.
+const BOX_COLOR = "rgba(0,255,120,0.9)";
+const TEXT_COLOR = "#000";
+const TEXT_BG = "rgba(255,255,255,0.85)";
 
-            return new Promise(resolve => {
-                video.onloadedmetadata = () => resolve(video);
-            });
+/* ---------------------- UTILIDADES ------------------------- */
+
+// Intersection over Union (IoU) para NMS
+function iou(boxA, boxB) {
+  const xA = Math.max(boxA[0], boxB[0]);
+  const yA = Math.max(boxA[1], boxB[1]);
+  const xB = Math.min(boxA[2], boxB[2]);
+  const yB = Math.min(boxA[3], boxB[3]);
+  const interArea = Math.max(0, xB - xA) * Math.max(0, yB - yA);
+  const boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]);
+  const boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]);
+  return interArea / (boxAArea + boxBArea - interArea + 1e-6);
+}
+
+// Non-max suppression (entrada: detecciones [{box:[x1,y1,x2,y2], score, classId}])
+function nms(dets, iouThreshold) {
+  dets.sort((a,b) => b.score - a.score);
+  const keep = [];
+  for (let i = 0; i < dets.length; i++) {
+    let keepFlag = true;
+    for (let j = 0; j < keep.length; j++) {
+      if (dets[i].classId === keep[j].classId) {
+        if (iou(dets[i].box, keep[j].box) > iouThreshold) {
+          keepFlag = false;
+          break;
         }
+      }
+    }
+    if (keepFlag) keep.push(dets[i]);
+  }
+  return keep;
+}
 
-        // Cargar el modelo ONNX
-        async function cargarModelo() {
-            console.log("Cargando modelo...");
-            const session = await ort.InferenceSession.create(
-                MODEL_URL,
-                { executionProviders: ["wasm"] }
-            );
-            console.log("Modelo cargado correctamente ✔");
-            return session;
+/* -------------------- PREPROCESS y POSTPROCESS -------------------- */
+
+// Preprocess: obtiene un tensor [1,3,MODEL_INPUT_SIZE,MODEL_INPUT_SIZE] tipo float32
+function preprocessImageToTensor(video) {
+  // crear canvas temporal para redimensionar manteniendo aspect ratio (se estira a 640x640)
+  const tmp = document.createElement("canvas");
+  tmp.width = MODEL_INPUT_SIZE;
+  tmp.height = MODEL_INPUT_SIZE;
+  const tctx = tmp.getContext("2d");
+  // dibuja video estirado a 640x640 (YOLO normalmente entrenado con resize:stretch)
+  tctx.drawImage(video, 0, 0, tmp.width, tmp.height);
+  const imageData = tctx.getImageData(0, 0, tmp.width, tmp.height).data;
+
+  // ONNX Runtime espera formato [1,3,H,W] en float32
+  const floatData = new Float32Array(3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
+  const pxCount = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
+  for (let i = 0; i < pxCount; i++) {
+    const r = imageData[i * 4 + 0] / 255.0;
+    const g = imageData[i * 4 + 1] / 255.0;
+    const b = imageData[i * 4 + 2] / 255.0;
+    floatData[i] = r;                      // channel R plane
+    floatData[i + pxCount] = g;            // channel G plane
+    floatData[i + 2 * pxCount] = b;        // channel B plane
+  }
+  return new ort.Tensor("float32", floatData, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+}
+
+// Postprocess: interpreta salida típica YOLO (1,N,85) o (N,85)
+// Devuelve lista de detecciones: {box:[x1,y1,x2,y2], score, classId}
+function decodeYOLOOutput(outputTensor, canvasW, canvasH) {
+  // outputTensor.data (Float32Array), outputTensor.dims (Array)
+  const data = outputTensor.data;
+  const dims = outputTensor.dims; // ej: [1, N, C] o [N, C]
+  let rows = 0, cols = 0, offset = 0;
+  if (dims.length === 3) {
+    rows = dims[1];
+    cols = dims[2];
+    offset = 0;
+  } else if (dims.length === 2) {
+    rows = dims[0];
+    cols = dims[1];
+    offset = 0;
+  } else {
+    console.warn("Formato de salida ONNX inesperado:", dims);
+    return [];
+  }
+
+  const dets = [];
+  for (let r = 0; r < rows; r++) {
+    const base = offset + r * cols;
+    // formato esperado: [x, y, w, h, obj_conf, class1, class2, ...]  (o similar)
+    // o [cx, cy, w, h, conf, cls1, cls2,...]
+    // Buscamos la mejor clase
+    const objConf = data[base + 4]; // si el 5to elemento es obj_conf
+    // maximizar sobre clases
+    let maxClass = -1;
+    let maxScore = 0;
+    for (let c = 5; c < cols; c++) {
+      const s = data[base + c];
+      if (s > maxScore) { maxScore = s; maxClass = c - 5; }
+    }
+    const score = objConf * maxScore;
+    if (score < CONF_THRESHOLD) continue;
+
+    // leer bbox (asumimos formato cx,cy,w,h normalizados o en pixeles)
+    let cx = data[base + 0];
+    let cy = data[base + 1];
+    let w = data[base + 2];
+    let h = data[base + 3];
+
+    // Algunos modelos devuelven boxes en escala 0..1 (normalizados), otros en px.
+    // Detectar: si los valores parecen ≤ 1 -> normalizados.
+    const normalized = (cx <= 1 && cy <= 1 && w <= 1 && h <= 1);
+
+    if (normalized) {
+      cx *= canvasW;
+      cy *= canvasH;
+      w *= canvasW;
+      h *= canvasH;
+    } else {
+      // si salida en escala 640 (modelo entrenado en 640), escalar a canvas dimensiones
+      const scaleX = canvasW / MODEL_INPUT_SIZE;
+      const scaleY = canvasH / MODEL_INPUT_SIZE;
+      cx *= scaleX;
+      cy *= scaleY;
+      w *= scaleX;
+      h *= scaleY;
+    }
+
+    // convertir cx,cy,w,h -> x1,y1,x2,y2
+    const x1 = cx - w / 2;
+    const y1 = cy - h / 2;
+    const x2 = cx + w / 2;
+    const y2 = cy + h / 2;
+
+    dets.push({
+      box: [x1, y1, x2, y2],
+      score: score,
+      classId: maxClass
+    });
+  }
+
+  // aplicar NMS por clase
+  const final = nms(dets, IOU_THRESHOLD);
+  return final;
+}
+
+/* -------------------- MAIN: cámara + modelo + loop -------------------- */
+
+let session = null;
+let inputName = null;
+let outputName = null;
+
+async function loadModel() {
+  document.getElementById("status").innerText = "Estado: cargando modelo...";
+  try {
+    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ["wasm"] });
+    // obtener nombres de entrada/salida dinámicamente
+    const inputKeys = Object.keys(session.inputNames ? session.inputNames : session.inputMetadata);
+    const outputKeys = Object.keys(session.outputNames ? session.outputNames : session.outputMetadata);
+    // Fallbacks seguros:
+    inputName = inputKeys.length ? inputKeys[0] : (session.inputNames && session.inputNames[0]) || Object.keys(session.inputMetadata)[0];
+    outputName = outputKeys.length ? outputKeys[0] : (session.outputNames && session.outputNames[0]) || Object.keys(session.outputMetadata)[0];
+
+    // Si session.inputNames no está disponible, usar metadata keys:
+    if (!inputName) inputName = Object.keys(session.inputMetadata)[0];
+    if (!outputName) outputName = Object.keys(session.outputMetadata)[0];
+
+    document.getElementById("status").innerText = "Estado: modelo cargado ✔";
+    console.log("Modelo ONNX cargado. input:", inputName, "output:", outputName);
+  } catch (err) {
+    console.error("Error cargando modelo:", err);
+    document.getElementById("status").innerText = "Error cargando modelo: " + (err.message || err);
+    throw err;
+  }
+}
+
+async function startCameraAndRun() {
+  document.getElementById("status").innerText = "Estado: activando cámara...";
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("canvas");
+  const ctx = canvas.getContext("2d");
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+    video.srcObject = stream;
+    await new Promise(resolve => video.onloadedmetadata = resolve);
+
+    // ajustar canvas al tamaño del video
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    document.getElementById("status").innerText = "Estado: cámara activa, procesando...";
+
+    // loop de inferencia ligero (no bloquear UI)
+    async function frameLoop() {
+      // dibuja el frame
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // preprocesar
+      const inputTensor = preprocessImageToTensor(video);
+
+      // ejecutar
+      let feeds = {};
+      feeds[inputName] = inputTensor;
+
+      try {
+        const outputMap = await session.run(feeds);
+        const outTensor = outputMap[outputName];
+
+        if (outTensor) {
+          // decodificar detecciones
+          const detections = decodeYOLOOutput(outTensor, canvas.width, canvas.height);
+
+          // dibujar cajas encima del canvas
+          drawDetectionsOnCanvas(ctx, detections);
+        } else {
+          // si no existe outputName, intentar tomar el primer tensor del mapa
+          const firstKey = Object.keys(outputMap)[0];
+          if (firstKey) {
+            const outT = outputMap[firstKey];
+            const detections = decodeYOLOOutput(outT, canvas.width, canvas.height);
+            drawDetectionsOnCanvas(ctx, detections);
+          }
         }
+      } catch (e) {
+        console.error("Error durante inferencia:", e);
+        document.getElementById("status").innerText = "Error en inferencia: " + e.message;
+      }
 
-        // Bucle principal de video
-        async function procesar(video, session) {
-            const canvas = document.getElementById("canvas");
-            const ctx = canvas.getContext("2d");
+      // siguiente frame
+      requestAnimationFrame(frameLoop);
+    }
 
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
+    frameLoop();
+  } catch (err) {
+    console.error("No se pudo abrir la cámara:", err);
+    document.getElementById("status").innerText = "No se pudo abrir la cámara: " + err.message;
+  }
+}
 
-            // Dibujar video (NO detección todavía)
-            function loop() {
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                requestAnimationFrame(loop);
-            }
+// función que dibuja las detecciones (bounding boxes + etiqueta)
+function drawDetectionsOnCanvas(ctx, detections) {
+  // redibuja fondo (el video ya está pintado por quien llama)
+  detections.forEach(det => {
+    const [x1, y1, x2, y2] = det.box.map(v => Math.max(0, Math.min(v, ctx.canvas.width)));
+    const w = x2 - x1, h = y2 - y1;
+    // rect
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = BOX_COLOR;
+    ctx.fillStyle = BOX_COLOR;
+    ctx.strokeRect(x1, y1, w, h);
 
-            loop();
-        }
+    // etiqueta: usamos "Clase {id}" porque no tenemos nombres
+    const label = `Clase ${det.classId} ${(det.score*100).toFixed(0)}%`;
 
-        // Inicio
-        async function main() {
-            const video = await iniciarCamara();
-            const session = await cargarModelo();
-            procesar(video, session);
-        }
+    // fondo texto
+    ctx.font = "16px sans-serif";
+    const textW = ctx.measureText(label).width;
+    const pad = 6;
+    ctx.fillStyle = TEXT_BG;
+    ctx.fillRect(x1, Math.max(0, y1 - 22), textW + pad, 20);
 
-        main();
-    </script>
+    // texto
+    ctx.fillStyle = "#000";
+    ctx.fillText(label, x1 + 4, Math.max(12, y1 - 6));
+  });
+}
+
+/* -------------------- BOTONES / INICIO -------------------- */
+
+document.getElementById("btnStart").addEventListener("click", async () => {
+  document.getElementById("btnStart").disabled = true;
+  document.getElementById("status").innerText = "Estado: cargando modelo...";
+  try {
+    await loadModel();
+    await startCameraAndRun();
+    document.getElementById("status").innerText = "Estado: Ejecutando (presiona actualizar para reiniciar)";
+  } catch (err) {
+    console.error(err);
+    document.getElementById("status").innerText = "Error: " + (err.message || err);
+    document.getElementById("btnStart").disabled = false;
+  }
+});
+</script>
 </body>
 </html>
